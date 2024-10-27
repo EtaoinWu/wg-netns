@@ -210,6 +210,121 @@ class Interface:
 
 
 @dataclasses.dataclass
+class SingleAddress:
+    v4: str|None = None
+    v6: str|None = None
+    v6_link_local: str|None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SingleAddress:
+        data = {key.replace('-', '_'): value for key, value in data.items()}
+        return cls(**data)
+    
+
+@dataclasses.dataclass
+class P2PPeer:
+    public_key: str
+    address: SingleAddress
+    preshared_key: Optional[str] = None
+    name: Optional[str] = None
+    endpoint: Optional[str] = None
+    persistent_keepalive: int = 0
+    allowed_ips: list[str] = dataclasses.field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> P2PPeer:
+        address = data.pop('address', {})
+        data = {key.replace('-', '_'): value for key, value in data.items()}
+        return cls(**data, address=SingleAddress.from_dict(address))
+
+    def setup(self, interface: P2PInterface, namespace: str|None) -> P2PPeer:
+        options = [
+            'peer', self.public_key,
+            'preshared-key', '/dev/stdin' if self.preshared_key else '/dev/null',
+            'persistent-keepalive', self.persistent_keepalive,
+        ]
+        if self.endpoint:
+            options.extend(('endpoint', self.endpoint))
+        if self.allowed_ips:
+            options.extend(('allowed-ips', ','.join(self.allowed_ips)))
+        wg('set', interface.name, *options, stdin=self.preshared_key, netns=namespace)
+        return self
+
+
+@dataclasses.dataclass
+class P2PInterface:
+    name: str
+    address: SingleAddress
+    peer: P2PPeer
+    base_netns: str|None = None
+    private_key: Optional[str] = None
+    public_key: Optional[str] = None
+    listen_port: int = 0
+    fwmark: int = 0
+    mtu: int = 1420
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], base_netns: str|None = None) -> P2PInterface:
+        peer = data.pop('peer', {})
+        address = data.pop('address', {})
+        return cls(**data, peer=P2PPeer.from_dict(peer), address=SingleAddress.from_dict(address), base_netns=base_netns)
+
+    def setup(self, namespace: Namespace) -> P2PInterface:
+        self._create()
+        self._configure_wireguard()
+        self.peer.setup(self, self.base_netns)
+        self._assign_namespace(namespace.name)
+        self._assign_address(namespace.name)
+        self._bring_up(namespace.name)
+        self._assign_peer(namespace.name)
+        return self
+
+    def _create(self) -> None:
+        ip('link', 'add', self.name, 'type', 'wireguard', netns=self.base_netns)
+
+    def _configure_wireguard(self) -> None:
+        wg('set', self.name, 'listen-port', self.listen_port, netns=self.base_netns)
+        wg('set', self.name, 'fwmark', self.fwmark, netns=self.base_netns)
+        if self.private_key:
+            wg('set', self.name, 'private-key', '/dev/stdin', stdin=self.private_key, netns=self.base_netns)
+
+    def _assign_namespace(self, namespace: str|None) -> None:
+        ip('link', 'set', self.name, 'netns', namespace if namespace else '1', netns=self.base_netns)
+
+    def _assign_address(self, namespace: str|None) -> None:
+        # if self.address.v4:
+        #     ip('-4', 'address', 'add', self.address.v4, 'dev', self.name, netns=namespace)
+        # if self.address.v6:
+        #     ip('-6', 'address', 'add', self.address.v6, 'dev', self.name, netns=namespace)
+        if self.address.v6_link_local:
+            ip('-6', 'address', 'add', self.address.v6_link_local, 'dev', self.name, netns=namespace)
+
+    def _bring_up(self, namespace: str|None) -> None:
+        ip('link', 'set', 'dev', self.name, 'mtu', self.mtu, 'up', netns=namespace)
+
+    def _assign_peer(self, namespace: str|None):
+        if self.peer.address.v4 and self.peer.address.v4:
+            ip('-4', 'addr', 'add', self.address.v4, 'peer', self.peer.address.v4, 'dev', self.name, netns=namespace)
+        if self.peer.address.v6 and self.peer.address.v6:
+            ip('-6', 'addr', 'add', self.address.v6, 'peer', self.peer.address.v6, 'dev', self.name, netns=namespace)
+        if self.peer.address.v6_link_local and self.peer.address.v6_link_local:
+            ip('-6', 'addr', 'add', self.address.v6_link_local, 'peer', self.peer.address.v6_link_local, 'dev', self.name, netns=namespace)
+
+    def teardown(self, namespace: Namespace, check=True) -> P2PInterface:
+        if self.exists(namespace):
+            ip('link', 'set', self.name, 'down', check=check, netns=namespace.name)
+            ip('link', 'delete', self.name, check=check, netns=namespace.name)
+        return self
+
+    def exists(self, namespace: Namespace) -> bool:
+        try:
+            ip('link', 'show', self.name, capture=True, netns=namespace.name)
+            return True
+        except Exception:
+            return False
+        
+
+@dataclasses.dataclass
 class ScriptletItem:
     command: str
     host_namespace: bool = False
@@ -269,6 +384,7 @@ class Namespace:
     managed: bool = True
     dns_server: list[str] = dataclasses.field(default_factory=list)
     interfaces: list[Interface] = dataclasses.field(default_factory=list)
+    p2p_interfaces: list[P2PInterface] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_profile(cls, path: Path) -> Namespace:
@@ -304,9 +420,11 @@ class Namespace:
         scriptlets = {key: data.pop(key, None) for key in ['pre_up', 'post_up', 'pre_down', 'post_down']}
         scriptlets = {key: Scriptlet.from_value(value) for key, value in scriptlets.items() if value is not None}
         interfaces = data.pop('interfaces', list())
+        p2p_interfaces = data.pop('p2p_interfaces', list())
         base_netns = data.pop('base_netns', None)
         interfaces = [Interface.from_dict({key.replace('-', '_'): value for key, value in interface.items()}, base_netns=base_netns) for interface in interfaces]
-        return cls(**data, **scriptlets, interfaces=interfaces)  # type: ignore
+        p2p_interfaces = [P2PInterface.from_dict({key.replace('-', '_'): value for key, value in interface.items()}, base_netns=base_netns) for interface in p2p_interfaces]
+        return cls(**data, **scriptlets, interfaces=interfaces, p2p_interfaces=p2p_interfaces)  # type: ignore
 
     def setup(self) -> Namespace:
         if self.managed and self.name:
@@ -316,6 +434,8 @@ class Namespace:
             self.pre_up.run(netns=self.name)
         for interface in self.interfaces:
             interface.setup(self)
+        for interface in self.p2p_interfaces:
+            interface.setup(self)
         if self.post_up:
             self.post_up.run(netns=self.name)
         return self
@@ -324,6 +444,8 @@ class Namespace:
         if self.pre_down:
             self.pre_down.run(netns=self.name)
         for interface in self.interfaces:
+            interface.teardown(self, check=check)
+        for interface in self.p2p_interfaces:
             interface.teardown(self, check=check)
         if self.post_down:
             self.post_down.run(netns=self.name)

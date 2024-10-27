@@ -3,6 +3,8 @@
 [wg-quick](https://git.zx2c4.com/wireguard-tools/about/src/man/wg-quick.8) with support for Linux network namespaces.
 A simple Python script that implements the steps described at [wireguard.com/netns](https://www.wireguard.com/netns/#ordinary-containerization).
 
+This version is modified by EtaoinWu to support peer-to-peer interfaces for use of dn42.
+
 ## Setup
 
 Requirements:
@@ -17,19 +19,19 @@ Installation:
 a) With [pipx](https://github.com/pypa/pipx).
 
 ~~~ bash
-pipx install git+https://github.com/dadevel/wg-netns.git@main
+pipx install git+https://github.com/EtaoinWu/wg-netns.git@main
 ~~~
 
 b) With `pip`.
 
 ~~~ bash
-pip install --user git+https://github.com/dadevel/wg-netns.git@main
+pip install --user git+https://github.com/EtaoinWu/wg-netns.git@main
 ~~~
 
 c) As standalone script.
 
 ~~~ bash
-curl -o ~/.local/bin/wg-netns https://raw.githubusercontent.com/dadevel/wg-netns/main/wgnetns/main.py
+curl -o ~/.local/bin/wg-netns https://raw.githubusercontent.com/EtaoinWu/wg-netns/main/wgnetns/main.py
 chmod +x ~/.local/bin/wg-netns
 ~~~
 
@@ -125,6 +127,26 @@ interfaces:
     allowed-ips:
     - 10.10.12.0/24
     - fc00:dead:beef:2::/64
+p2p-interfaces:
+  # interface name, required
+- name: wg-p2p-1
+  address:
+    v4: 10.10.13.172/32
+    v6: fc00:dead:beef:3::172/128
+  private-key: 4bvaEZHI...
+  listen-port: 51823
+  fwmark: 23
+  peer:
+    public-key: bELgMXGt...
+    preshared-key: 5daskLoW...
+    endpoint: vpn.example.com:51820
+    persistent-keepalive: 25
+    allowed-ips:
+    - 10.10.13.0/24
+    - fc00:dead:beef:3::/64
+    address:
+      v4: 10.10.13.192/32
+      v6: fc00:dead:beef:3::192/128
 ~~~
 
 Now it's time to setup your new network namespace and all associated wireguard interfaces.
@@ -151,21 +173,16 @@ You can also spawn a shell inside the netns.
 ip netns exec ns-example bash -i
 ~~~
 
-### Systemd Service
+### Extra information
 
-You can find a `wg-quick@.service` equivalent at [wg-netns@.service](./extras/wg-netns@.service).
-Place your profile in `/etc/wireguard/`, e.g. `example.json`, then start the service.
+For these topics:
 
-~~~ bash
-curl -o /etc/systemd/system/wg-netns@.service https://raw.githubusercontent.com/dadevel/wg-netns/main/extras/wg-netns@.service
-systemctl enable --now wg-netns@example.service
-~~~
+- systemd service
+- port forwarding with socat
+- wireguard with dyndns
+- firefox in network namespace
 
-If you are using SELinux, you have to change the SELinux context label, e.g. to `bin_t`, otherwise the service will not find the executable.
-
-~~~ bash
-chcon -t bin_t /root/.local/bin/wg-netns
-~~~
+Please see [dadevel](https://github.com/dadevel/wg-netns)'s upstream for more information.
 
 ### Podman Integration
 
@@ -174,33 +191,4 @@ The example below starts a container connected to a netns named *ns-example*.
 
 ~~~ bash
 podman run -it --rm --network ns:/run/netns/ns-example docker.io/library/alpine wget -q -O - https://ipinfo.io
-~~~
-
-### Port Forwarding with Socat
-
-[netns-publish](./extras/netns-publish.sh) is a small wrapper around `socat` that can forward TCP traffic from outside a network namespace to a port inside a network namespace.
-
-Example: All connections to port 1234/tcp in the main/default netns are forwarded to port 5678/tcp in the *ns-example* namespace.
-
-~~~ bash
-# terminal 1, create netns and start http server inside
-wg-netns up ns-example
-echo 'Hello from ns-example!' > ./hello.txt
-ip netns exec ns-example python3 -m http.server 5678
-# terminal 2, setup port forwarding
-./extras/netns-publish.sh 1234 ns-example 127.0.0.1:5678
-# terminal 3, test access
-curl http://127.0.0.1:1234/hello.txt
-~~~
-
-### WireGuard with DynDNS
-
-If your WireGuard server endpoint is a DynDNS domain you can use the [wg-resolve](./extras/wg-resolve/) script to periodically check the connectivity and re-resolve the endpoint if necessary. 
-
-### Firefox in Network Namespace
-
-Start a dedicated Firefox profile with working audio inside the netns created by `wg-netns`.
-
-~~~ bash
-sudo ip netns exec ns-example sudo -u "$USER" "HOME=$HOME" "PULSE_SERVER=/run/user/$(id -u)/pulse/native" "PULSE_COOKIE=$HOME/.config/pulse/cookie" firefox -P vpn
 ~~~
